@@ -45,6 +45,14 @@ save_folder="results/combined_dadras_tsucs1_halvorsen_values8"
 combined_data_dir="$ROOT_DIR/training_data/combined/dadras_tsucs1_halvorsen_values8"
 run_name="dadras_tsucs1_halvorsen_values8"
 
+# Windowed arrays use axis 1 as the window/sample axis, so the datasets are
+# combined there. For test arrays only, Dadras/Tsucs1 have 12000 time points
+# while Halvorsen has 10000, so the combined validation test is cropped to the
+# common time length. The separate slide evaluations still use the original
+# per-dataset test arrays.
+COMBINE_AXIS="${COMBINE_AXIS:-1}"
+ALIGN_TEST_TIME_AXIS="${ALIGN_TEST_TIME_AXIS:-crop_min}"
+
 dataset_dir() {
   local regime="$1"
   local variant="$2"
@@ -101,6 +109,8 @@ build_combined_dataset() {
   TSUCS1_DIR="$tsucs1_dir" \
   HALVORSEN_DIR="$halvorsen_dir" \
   OUTPUT_DIR="$output_dir" \
+  COMBINE_AXIS="$COMBINE_AXIS" \
+  ALIGN_TEST_TIME_AXIS="$ALIGN_TEST_TIME_AXIS" \
   python - <<'PY'
 import json
 import os
@@ -115,6 +125,8 @@ sources = [
     ("halvorsen_14to209_noisy_windows", Path(os.environ["HALVORSEN_DIR"])),
 ]
 output_dir = Path(os.environ["OUTPUT_DIR"])
+combine_axis = int(os.environ.get("COMBINE_AXIS", "1"))
+align_test_time_axis = os.environ.get("ALIGN_TEST_TIME_AXIS", "crop_min")
 output_dir.mkdir(parents=True, exist_ok=True)
 
 required_files = [
@@ -144,20 +156,50 @@ for filename in required_files:
         shapes.append((label, arr.shape))
         dtypes.append((label, str(arr.dtype)))
 
-    tail_shapes = {shape[1:] for _, shape in shapes}
-    if len(tail_shapes) != 1:
+    cropped_time_axis0_to = None
+    rank = len(shapes[0][1])
+    if any(len(shape) != rank for _, shape in shapes):
         lines = "\n".join(f"  {label}: {shape}" for label, shape in shapes)
-        raise ValueError(
-            f"Cannot concatenate {filename}: shapes differ after axis 0:\n{lines}"
-        )
+        raise ValueError(f"Cannot concatenate {filename}: ranks differ:\n{lines}")
+    if combine_axis < 0 or combine_axis >= rank:
+        raise ValueError(f"Invalid COMBINE_AXIS={combine_axis} for {filename}")
 
-    combined = np.concatenate(arrays, axis=0)
+    comparable_shapes = []
+    for _, shape in shapes:
+        comparable_shapes.append(shape[:combine_axis] + shape[combine_axis + 1 :])
+
+    if len(set(comparable_shapes)) != 1:
+        can_crop_test_time = (
+            filename in {"test.npy", "test_phi.npy"}
+            and align_test_time_axis == "crop_min"
+            and combine_axis == 1
+            and rank >= 2
+            and len({shape[2:] for _, shape in shapes}) == 1
+        )
+        if not can_crop_test_time:
+            lines = "\n".join(f"  {label}: {shape}" for label, shape in shapes)
+            raise ValueError(
+                f"Cannot concatenate {filename} on axis {combine_axis}:\n{lines}"
+            )
+
+        cropped_time_axis0_to = min(shape[0] for _, shape in shapes)
+        cropped_arrays = []
+        for arr in arrays:
+            index = [slice(None)] * arr.ndim
+            index[0] = slice(0, cropped_time_axis0_to)
+            cropped_arrays.append(arr[tuple(index)])
+        arrays = cropped_arrays
+        print(f"Cropping {filename} time axis 0 to length {cropped_time_axis0_to}")
+
+    combined = np.concatenate(arrays, axis=combine_axis)
     np.save(output_dir / filename, combined)
     summary["files"][filename] = {
         "shape": list(combined.shape),
         "dtype": str(combined.dtype),
         "source_shapes": {label: list(shape) for label, shape in shapes},
         "source_dtypes": {label: dtype for label, dtype in dtypes},
+        "combine_axis": combine_axis,
+        "cropped_time_axis0_to": cropped_time_axis0_to,
     }
     print(f"Wrote {output_dir / filename}: {combined.shape} {combined.dtype}")
 
