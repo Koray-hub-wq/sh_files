@@ -210,20 +210,6 @@ for filename in required_files:
 PY
 }
 
-mark_btip_config_as_expert_phi() {
-  local config_path="$1/config.json"
-  python - "$config_path" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-config = json.loads(path.read_text(encoding="utf-8"))
-config["use_expert_phi"] = True
-path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-PY
-}
-
 train_no_phi() {
   local repo="$1"
   local base="$2"
@@ -261,6 +247,58 @@ train_with_phi() {
     --phi_path "$base/phi.npy" \
     --context_phi_path "$base/context_phi.npy" \
     --test_phi_path "$base/test_phi.npy" \
+    --device cuda \
+    --gpu_id "$GPU_ID" \
+    --threads 4 \
+    --latent_dim "$latent_dim" \
+    --experts "$experts" \
+    --pwl_units 2 \
+    --batch_size 8 \
+    --batches_per_epoch 20 \
+    --epochs 500 \
+    --ssi 25 \
+    --noise_level 0.02 \
+    --save_path "$save_path"
+}
+
+train_btip_phi_only() {
+  local base="$1"
+  local save_path="$2"
+
+  cd "$BTIP_REPO"
+  python -m src.dynamix.training.training_setup \
+    --data_path "$base/data.npy" \
+    --context_path "$base/context.npy" \
+    --test_path "$base/test.npy" \
+    --phi_path "$base/phi.npy" \
+    --test_phi_path "$base/test_phi.npy" \
+    --device cuda \
+    --gpu_id "$GPU_ID" \
+    --threads 4 \
+    --latent_dim "$latent_dim" \
+    --experts "$experts" \
+    --pwl_units 2 \
+    --batch_size 8 \
+    --batches_per_epoch 20 \
+    --epochs 500 \
+    --ssi 25 \
+    --noise_level 0.02 \
+    --save_path "$save_path"
+}
+
+train_context_phi_and_expert_cphi() {
+  local base="$1"
+  local save_path="$2"
+
+  cd "$CONTEXT_REPO"
+  python -m src.dynamix.training.training_setup \
+    --data_path "$base/data.npy" \
+    --context_path "$base/context.npy" \
+    --test_path "$base/test.npy" \
+    --phi_path "$base/phi.npy" \
+    --context_phi_path "$base/context_phi.npy" \
+    --test_phi_path "$base/test_phi.npy" \
+    --use_expert_phi \
     --device cuda \
     --gpu_id "$GPU_ID" \
     --threads 4 \
@@ -321,26 +359,29 @@ build_combined_dataset "$DADRAS_DIR" "$TSUCS1_DIR" "$HALVORSEN_DIR" "$combined_d
 
 CONTEXT_NO_PHI_RUN="$CONTEXT_REPO/$save_folder/${run_name}_context_no_phi"
 CONTEXT_PHI_RUN="$CONTEXT_REPO/$save_folder/${run_name}_context_phi"
-BTIP_NO_PHI_RUN="$BTIP_REPO/$save_folder/${run_name}_btip_no_phi"
 BTIP_PHI_RUN="$BTIP_REPO/$save_folder/${run_name}_btip_cphi"
+CONTEXT_PHI_CPHI_RUN="$CONTEXT_REPO/$save_folder/${run_name}_context_phi_expert_cphi"
 
 echo "==============================================="
 echo "Training on combined dataset"
 echo "Run name: $run_name"
 echo "==============================================="
 
-echo "Training context repo WITHOUT phi/Cphi..."
-train_no_phi "$CONTEXT_REPO" "$combined_data_dir" "$save_folder/${run_name}_context_no_phi"
+# Resume mode:
+# The previous run already trained the reusable baselines below. Keep these
+# disabled so the script only trains the missing true combination model.
+#
+# Already trained vanilla DynaMix WITHOUT phi/Cphi:
+# train_no_phi "$CONTEXT_REPO" "$combined_data_dir" "$save_folder/${run_name}_context_no_phi"
+#
+# Already trained context repo WITH context_phi, WITHOUT expert Cphi:
+# train_with_phi "$CONTEXT_REPO" "$combined_data_dir" "$save_folder/${run_name}_context_phi"
+#
+echo "Training b-tipping / expert Cphi model WITHOUT context_phi..."
+train_btip_phi_only "$combined_data_dir" "$save_folder/${run_name}_btip_cphi"
 
-echo "Training context repo WITH context_phi, WITHOUT expert Cphi..."
-train_with_phi "$CONTEXT_REPO" "$combined_data_dir" "$save_folder/${run_name}_context_phi"
-
-echo "Training b-tipping repo WITHOUT phi/Cphi..."
-train_no_phi "$BTIP_REPO" "$combined_data_dir" "$save_folder/${run_name}_btip_no_phi"
-
-echo "Training b-tipping repo WITH context_phi and expert Cphi..."
-train_with_phi "$BTIP_REPO" "$combined_data_dir" "$save_folder/${run_name}_btip_cphi"
-mark_btip_config_as_expert_phi "$BTIP_PHI_RUN"
+echo "Training combined context repo model WITH context_phi and expert Cphi..."
+train_context_phi_and_expert_cphi "$combined_data_dir" "$save_folder/${run_name}_context_phi_expert_cphi"
 
 SLIDE_DATASETS=(
   "dadras:$DADRAS_DIR"
@@ -370,19 +411,19 @@ for ITEM in "${SLIDE_DATASETS[@]}"; do
     "$DATA_DIR" \
     "$BTIP_REPO" \
     "$BTIP_REPO" \
-    "$BTIP_REPO" \
+    "$CONTEXT_REPO" \
     "$BTIP_PHI_RUN" \
-    "$BTIP_NO_PHI_RUN" \
-    "$BTIP_REPO/$save_folder/slides/${LABEL}_${run_name}_btip_cphi_vs_btip_no_phi"
+    "$CONTEXT_NO_PHI_RUN" \
+    "$BTIP_REPO/$save_folder/slides/${LABEL}_${run_name}_btip_cphi_vs_vanilla"
 
   make_pair_slides \
     "$DATA_DIR" \
-    "$BTIP_REPO" \
-    "$BTIP_REPO" \
     "$CONTEXT_REPO" \
-    "$BTIP_PHI_RUN" \
-    "$CONTEXT_PHI_RUN" \
-    "$BTIP_REPO/$save_folder/slides/${LABEL}_${run_name}_btip_cphi_vs_context_phi"
+    "$CONTEXT_REPO" \
+    "$CONTEXT_REPO" \
+    "$CONTEXT_PHI_CPHI_RUN" \
+    "$CONTEXT_NO_PHI_RUN" \
+    "$CONTEXT_REPO/$save_folder/slides/${LABEL}_${run_name}_context_phi_expert_cphi_vs_vanilla"
 done
 
 echo "==============================================="
